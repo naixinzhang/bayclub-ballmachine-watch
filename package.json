@@ -1,0 +1,9 @@
+{
+  "name": "bayclub-ballmachine-watch",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Watches Bay Club Santa Clara Court 1 (ball machine) for 1-hour openings and pushes ntfy alerts",
+  "dependencies": {
+    "playwright": "^1.49.0"
+  }
+}

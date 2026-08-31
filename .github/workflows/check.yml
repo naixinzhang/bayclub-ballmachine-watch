@@ -1,0 +1,65 @@
+name: Bay Club ball machine watch
+
+on:
+  schedule:
+    # UTC. Pacific (PDT, UTC-7): every 20 min from 6:04am to 1:44am, off 2-6am.
+    # (When PST returns in November this shifts one hour earlier locally.)
+    - cron: '4,24,44 0-8,13-23 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ballmachine-watch
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Restore state (session + dedup)
+        uses: actions/cache/restore@v4
+        with:
+          path: .state
+          key: state-${{ github.run_id }}
+          restore-keys: state-
+
+      - name: Check with cached session
+        id: cached
+        run: node check.js --try-cached
+
+      - name: Cache Playwright browser
+        if: steps.cached.outputs.need_login == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ hashFiles('package-lock.json') }}
+
+      - name: Install Playwright (login needed)
+        if: steps.cached.outputs.need_login == 'true'
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Login and check
+        if: steps.cached.outputs.need_login == 'true'
+        env:
+          BAYCLUB_USERNAME: ${{ secrets.BAYCLUB_USERNAME }}
+          BAYCLUB_PASSWORD: ${{ secrets.BAYCLUB_PASSWORD }}
+        run: node check.js --login
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .state
+          key: state-${{ github.run_id }}
