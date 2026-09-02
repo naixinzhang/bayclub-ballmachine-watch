@@ -20,6 +20,7 @@ jobs:
     timeout-minutes: 8
     env:
       NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+      NTFY_EMAIL: ${{ secrets.NTFY_EMAIL }}
     steps:
       - uses: actions/checkout@v4
 

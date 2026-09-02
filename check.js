@@ -25,6 +25,7 @@ const apiUrl = (d) =>
   `https://connect-api.bayclubs.io/court-booking/api/1.0/courtsheet/${CLUB}/courts?date=${d}${QS}`;
 
 const NTFY_TOPIC = process.env.NTFY_TOPIC;
+const NTFY_EMAIL = process.env.NTFY_EMAIL; // optional: also forward each alert to this email
 
 function readJson(f, fallback) {
   try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return fallback; }
@@ -39,9 +40,11 @@ function setOutput(k, v) {
 
 async function ntfy(title, body, priority = 'high') {
   if (!NTFY_TOPIC) { console.log('NTFY_TOPIC not set; would have sent:', title, body); return; }
+  const headers = { Title: title, Priority: priority, Tags: 'tennis' };
+  if (NTFY_EMAIL) headers.Email = NTFY_EMAIL;
   const r = await fetch('https://ntfy.sh/' + NTFY_TOPIC, {
     method: 'POST',
-    headers: { Title: title, Priority: priority, Tags: 'tennis' },
+    headers,
     body,
   });
   console.log('ntfy push:', r.status, title);
