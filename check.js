@@ -26,6 +26,7 @@ const apiUrl = (d) =>
 
 const NTFY_TOPIC = process.env.NTFY_TOPIC;
 const NTFY_EMAIL = process.env.NTFY_EMAIL; // optional: also forward each alert to this email
+const NTFY_TOKEN = process.env.NTFY_TOKEN; // required by ntfy.sh for email forwarding
 
 function readJson(f, fallback) {
   try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return fallback; }
@@ -38,16 +39,33 @@ function setOutput(k, v) {
   if (process.env.GITHUB_OUTPUT) fs.appendFileSync(process.env.GITHUB_OUTPUT, `${k}=${v}\n`);
 }
 
+// Returns true only if ntfy accepted the push. Callers must not advance dedup
+// state on a false return, or the alert is lost forever.
 async function ntfy(title, body, priority = 'high') {
-  if (!NTFY_TOPIC) { console.log('NTFY_TOPIC not set; would have sent:', title, body); return; }
+  if (!NTFY_TOPIC) { console.log('NTFY_TOPIC not set; would have sent:', title, body); return true; }
   const headers = { Title: title, Priority: priority, Tags: 'tennis' };
-  if (NTFY_EMAIL) headers.Email = NTFY_EMAIL;
-  const r = await fetch('https://ntfy.sh/' + NTFY_TOPIC, {
-    method: 'POST',
-    headers,
-    body,
-  });
+  // ntfy.sh rejects anonymous email sending with 400/40053, and that rejection
+  // kills the phone push too. Only attach Email when we can authenticate.
+  if (NTFY_TOKEN) {
+    headers.Authorization = 'Bearer ' + NTFY_TOKEN;
+    if (NTFY_EMAIL) headers.Email = NTFY_EMAIL;
+  } else if (NTFY_EMAIL) {
+    console.log('NTFY_EMAIL set but NTFY_TOKEN missing; sending push only (email needs an ntfy account).');
+  }
+  let r;
+  try {
+    r = await fetch('https://ntfy.sh/' + NTFY_TOPIC, { method: 'POST', headers, body });
+  } catch (e) {
+    console.error('ntfy push FAILED (network):', e.message || e);
+    return false;
+  }
+  if (!r.ok) {
+    const detail = await r.text().catch(() => '');
+    console.error('ntfy push FAILED:', r.status, detail.slice(0, 300));
+    return false;
+  }
   console.log('ntfy push:', r.status, title);
+  return true;
 }
 
 function dateStr(dt) {
@@ -131,10 +149,17 @@ async function notifyIfNew(result) {
     console.log('Slots unchanged since last notification; not re-pushing.', key);
   } else {
     const lines = result.hits.map((h) => `${h.day} ${h.date}: ${h.windows.join(', ')}`);
-    await ntfy(
+    const sent = await ntfy(
       'Bay Club ball machine Court 1 AVAILABLE',
       lines.join('\n') + '\nBook: https://bayclubconnect.com/racquet-sports/create-booking/' + CLUB
     );
+    if (!sent) {
+      // Leave dedup state untouched so the next run retries instead of
+      // silently marking these slots as already announced.
+      console.error('Alert NOT delivered; leaving state so the next run retries.');
+      process.exitCode = 1;
+      return;
+    }
     console.log('Notified:', lines.join(' | '));
   }
   state.lastHitsKey = key;
@@ -210,9 +235,11 @@ async function login() {
     } catch (e) {
       const state = readJson(STATE_FILE, {});
       if (!state.loginFailNotified) {
-        await ntfy('Bay Club watcher: login FAILED', String(e.message || e) + ' — checks are paused until this is fixed.', 'high');
-        state.loginFailNotified = true;
-        writeJson(STATE_FILE, state);
+        const sent = await ntfy('Bay Club watcher: login FAILED', String(e.message || e) + ' — checks are paused until this is fixed.', 'high');
+        if (sent) {
+          state.loginFailNotified = true;
+          writeJson(STATE_FILE, state);
+        }
       }
       throw e;
     }

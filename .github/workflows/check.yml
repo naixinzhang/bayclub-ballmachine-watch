@@ -21,6 +21,9 @@ jobs:
     env:
       NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
       NTFY_EMAIL: ${{ secrets.NTFY_EMAIL }}
+      # Optional: ntfy.sh access token. Required for email forwarding —
+      # without it the Email header is dropped (anonymous email is rejected).
+      NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
