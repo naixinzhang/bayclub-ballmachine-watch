@@ -74,6 +74,14 @@ jobs:
           BAYCLUB_PASSWORD: ${{ secrets.BAYCLUB_PASSWORD }}
         run: node check.js --login
 
+      # Must sit before "Save state" so the alert's own dedup timestamp is
+      # written into the cache along with everything else.
+      - name: Alert that the watcher itself is broken
+        if: failure()
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: node check.js --alert-failure
+
       - name: Save state
         if: always()
         uses: actions/cache/save@v4

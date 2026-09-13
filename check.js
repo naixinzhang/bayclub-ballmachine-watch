@@ -1,7 +1,8 @@
 // Bay Club Santa Clara — Court 1 (ball machine) 1-hour availability watcher.
 // Runs in GitHub Actions. Two modes:
-//   node check.js --try-cached : use cached API headers; if missing/expired, signal need_login
-//   node check.js --login      : headless login via Playwright, capture headers, then check
+//   node check.js --try-cached    : use cached API headers; if missing/expired, signal need_login
+//   node check.js --login         : headless login via Playwright, capture headers, then check
+//   node check.js --alert-failure : push a "the watcher itself is broken" alert (CI failure hook)
 //
 // Alerts on >=60 min contiguous free time, horizon today +3 days (the club's
 // daysAheadLimit). What counts is declared in RULES below: Court 1 (the ball
@@ -28,6 +29,9 @@ const apiUrl = (d) =>
   `https://connect-api.bayclubs.io/court-booking/api/1.0/courtsheet/${CLUB}/courts?date=${d}${QS}`;
 
 const DAY_END = 24 * 60;
+// A broken watcher fails every 15 minutes. Alert at most this often about it,
+// or the failure notice becomes worse noise than having no notice at all.
+const FAILURE_QUIET_MS = 6 * 60 * 60 * 1000;
 const SAT = 6, SUN = 0;
 
 // Each rule is one alert category: which courts it watches, which slices of the
@@ -77,9 +81,9 @@ function setOutput(k, v) {
 
 // Returns true only if ntfy accepted the push. Callers must not advance dedup
 // state on a false return, or the alert is lost forever.
-async function ntfy(title, body, priority = 'high') {
+async function ntfy(title, body, priority = 'high', extra = {}) {
   if (!NTFY_TOPIC) { console.log('NTFY_TOPIC not set; would have sent:', title, body); return true; }
-  const headers = { Title: title, Priority: priority, Tags: 'tennis' };
+  const headers = { Title: title, Priority: priority, Tags: 'tennis', ...extra };
   // ntfy.sh rejects anonymous email sending with 400/40053, and that rejection
   // kills the phone push too. Only attach Email when we can authenticate.
   if (NTFY_TOKEN) {
@@ -282,7 +286,9 @@ async function notifyIfNew(result) {
 
   state.announced = announced;
   delete state.lastHitsKey; // superseded by per-slot dedup
+  // A check got all the way through, so re-arm both failure alerts.
   state.loginFailNotified = false;
+  delete state.failNotifiedAt;
   writeJson(STATE_FILE, state);
   if (failed) process.exitCode = 1;
 }
@@ -348,6 +354,31 @@ async function login() {
     return;
   }
 
+  // Called from the workflow's `if: failure()` step. Anything that kills a run
+  // before check.js can report -- a bad runner image, a Playwright install
+  // blowing up, a timeout -- is otherwise completely silent: the watcher just
+  // stops telling you about courts and nothing says why.
+  if (mode === '--alert-failure') {
+    const state = readJson(STATE_FILE, {});
+    const since = Date.now() - (state.failNotifiedAt || 0);
+    if (since < FAILURE_QUIET_MS) {
+      console.log(`Failure already alerted ${Math.round(since / 60000)} min ago; staying quiet.`);
+      return;
+    }
+    const url = process.env.RUN_URL || '';
+    const sent = await ntfy(
+      'Bay Club watcher FAILED',
+      'A watch run failed, so court alerts may be stale until this is fixed.'
+        + (url ? '\n' + url : ''),
+      'high',
+      { Tags: 'warning', ...(url ? { Click: url } : {}) }
+    );
+    if (!sent) { console.error('Could not deliver the failure alert.'); process.exitCode = 1; return; }
+    state.failNotifiedAt = Date.now();
+    writeJson(STATE_FILE, state);
+    return;
+  }
+
   if (mode === '--login') {
     let headers;
     try {
@@ -358,6 +389,7 @@ async function login() {
         const sent = await ntfy('Bay Club watcher: login FAILED', String(e.message || e) + ' — checks are paused until this is fixed.', 'high');
         if (sent) {
           state.loginFailNotified = true;
+          state.failNotifiedAt = Date.now(); // suppress the generic failure hook
           writeJson(STATE_FILE, state);
         }
       }
