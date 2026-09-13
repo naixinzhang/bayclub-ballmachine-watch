@@ -3,11 +3,11 @@
 //   node check.js --try-cached : use cached API headers; if missing/expired, signal need_login
 //   node check.js --login      : headless login via Playwright, capture headers, then check
 //
-// Two alert categories, both >=60 min contiguous free, horizon today +3 days
-// (the club's daysAheadLimit), both skipping the user's busy blocks
-// (Monday 7-9pm, Tuesday 9am-3pm Pacific):
-//   1. Court 1 (ballMachine=true) -- any time of day.
-//   2. Every other court -- evenings only, the hour must sit at/after 7pm.
+// Alerts on >=60 min contiguous free time, horizon today +3 days (the club's
+// daysAheadLimit). What counts is declared in RULES below: Court 1 (the ball
+// machine court) all day, every other court on weekday evenings from 7pm and
+// on weekend mornings 8-11am. All of it skips the user's standing commitments
+// (Monday evening, Tuesday 9am-3pm Pacific) -- see applyExclusions.
 // Notifies via ntfy.sh push. Dedup is per individual slot, so a change on one
 // court never re-pushes the slots you were already told about.
 
@@ -27,7 +27,38 @@ const QS =
 const apiUrl = (d) =>
   `https://connect-api.bayclubs.io/court-booking/api/1.0/courtsheet/${CLUB}/courts?date=${d}${QS}`;
 
-const EVENING_START = 19 * 60; // other courts only count from 7pm on
+const DAY_END = 24 * 60;
+const SAT = 6, SUN = 0;
+
+// Each rule is one alert category: which courts it watches, which slices of the
+// day count for it, and how the resulting push is addressed. Adding a watch
+// window means adding a rule here, nothing else.
+const RULES = [
+  {
+    id: 'ballmachine',
+    match: (c) => c.ballMachine,
+    windows: () => [[0, DAY_END]], // Court 1 is worth knowing about any time
+    title: 'Bay Club ball machine Court 1 AVAILABLE',
+    withCourt: false,
+    priority: 'high',
+  },
+  {
+    id: 'evening',
+    match: (c) => !c.ballMachine,
+    windows: () => [[19 * 60, DAY_END]],
+    title: 'Bay Club evening court AVAILABLE (7pm+)',
+    withCourt: true,
+    priority: 'default',
+  },
+  {
+    id: 'weekend-morning',
+    match: (c) => !c.ballMachine,
+    windows: (dow) => (dow === SAT || dow === SUN ? [[8 * 60, 11 * 60]] : []),
+    title: 'Bay Club weekend morning court AVAILABLE (8-11am)',
+    withCourt: true,
+    priority: 'default',
+  },
+];
 
 const NTFY_TOPIC = process.env.NTFY_TOPIC;
 const NTFY_EMAIL = process.env.NTFY_EMAIL; // optional: also forward each alert to this email
@@ -101,11 +132,11 @@ function freeRanges(court) {
   return ranges;
 }
 
-// The user's standing commitments. Applied to every court, so e.g. a Monday
-// 7:30pm opening on Court 5 is correctly ignored.
+// The user's standing commitments. Applied to every court and every rule, so
+// e.g. a Monday 9:30pm opening on Court 5 is correctly ignored.
 function applyExclusions(ranges, dow) {
   const excl = [];
-  if (dow === 1) excl.push([19 * 60, 21 * 60]); // Monday 7-9pm
+  if (dow === 1) excl.push([19 * 60, DAY_END]); // Monday evening -- unavailable
   if (dow === 2) excl.push([9 * 60, 15 * 60]);  // Tuesday 9am-3pm
   let usable = ranges;
   for (const [ef, et] of excl) {
@@ -120,15 +151,17 @@ function applyExclusions(ranges, dow) {
   return usable;
 }
 
-// Bookable 1-hour windows: clipped to `notBefore` (7pm for non-ball-machine
-// courts) and to now for today, snapped up to the 30-min booking grid, and
-// only kept if a full hour still fits after that snapping.
-function hourWindows(ranges, notBefore, nowMin) {
-  const floor = Math.max(notBefore, nowMin);
+// Bookable 1-hour windows inside the watch interval [from, to). The free range
+// is clipped to that interval (so 6:30-8:00PM alerts as 7:00-8:00PM rather than
+// being dropped) and to now for today, then snapped up to the 30-min booking
+// grid -- and only kept if a full hour still fits after the snapping.
+function hourWindows(ranges, [from, to], nowMin) {
+  const floor = Math.max(from, nowMin);
   const out = [];
   for (const [f, t] of ranges) {
     const start = Math.ceil(Math.max(f, floor) / 30) * 30;
-    if (t - start >= 60) out.push(fmt(start) + '-' + fmt(t));
+    const end = Math.min(t, to);
+    if (end - start >= 60) out.push(fmt(start) + '-' + fmt(end));
   }
   return out;
 }
@@ -138,9 +171,10 @@ function courtName(c) {
   return String(c.name || '').trim().replace(/^tennis\b/i, 'Tennis');
 }
 
-// Returns {ok, loggedOut, ballMachine, evening, errors}
+// Returns {ok, loggedOut, byRule: {<rule id>: hits[]}, errors}
 async function checkAvailability(headers) {
-  const ballMachine = [], evening = [], errors = [];
+  const byRule = Object.fromEntries(RULES.map((r) => [r.id, []]));
+  const errors = [];
   const now = new Date();
   for (let d = 0; d <= 3; d++) {
     const dt = new Date(now.getFullYear(), now.getMonth(), now.getDate() + d);
@@ -162,14 +196,14 @@ async function checkAvailability(headers) {
 
     for (const c of items) {
       const usable = applyExclusions(freeRanges(c), dow);
-      // Court 1 is watched all day; every other court only from 7pm.
-      const wins = hourWindows(usable, c.ballMachine ? 0 : EVENING_START, nowMin);
-      if (!wins.length) continue;
-      const bucket = c.ballMachine ? ballMachine : evening;
-      bucket.push({ date: ds, day, court: courtName(c), windows: wins });
+      for (const rule of RULES) {
+        if (!rule.match(c)) continue;
+        const wins = rule.windows(dow).flatMap((iv) => hourWindows(usable, iv, nowMin));
+        if (wins.length) byRule[rule.id].push({ date: ds, day, court: courtName(c), windows: wins });
+      }
     }
   }
-  return { ok: true, ballMachine, evening, errors };
+  return { ok: true, byRule, errors };
 }
 
 // ---- dedup -----------------------------------------------------------------
@@ -180,10 +214,17 @@ function slotKeys(hit) {
   return hit.windows.map((w) => `${hit.date}|${hit.court}|${w}`);
 }
 
-function pickNew(hits, announced) {
+// `claimed` stops two rules whose watch windows overlap from both announcing
+// the same slot in one tick.
+function pickNew(hits, announced, claimed) {
   const fresh = [];
   for (const h of hits) {
-    const windows = h.windows.filter((w) => !announced[`${h.date}|${h.court}|${w}`]);
+    const windows = h.windows.filter((w) => {
+      const k = `${h.date}|${h.court}|${w}`;
+      if (announced[k] || claimed.has(k)) return false;
+      claimed.add(k);
+      return true;
+    });
     if (windows.length) fresh.push({ ...h, windows });
   }
   return fresh;
@@ -215,23 +256,11 @@ async function notifyIfNew(result) {
 
   if (result.errors && result.errors.length) console.log('errors:', result.errors);
 
-  const alerts = [
-    {
-      hits: pickNew(result.ballMachine, announced),
-      title: 'Bay Club ball machine Court 1 AVAILABLE',
-      withCourt: false,
-      priority: 'high',
-    },
-    {
-      hits: pickNew(result.evening, announced),
-      title: 'Bay Club evening court AVAILABLE (7pm+)',
-      withCourt: true,
-      priority: 'default',
-    },
-  ];
+  const claimed = new Set();
+  const alerts = RULES.map((r) => ({ ...r, hits: pickNew(result.byRule[r.id] || [], announced, claimed) }));
 
   if (!alerts.some((a) => a.hits.length)) {
-    const open = result.ballMachine.length + result.evening.length;
+    const open = RULES.reduce((n, r) => n + (result.byRule[r.id] || []).length, 0);
     console.log(open ? `Nothing new; ${open} known slot(s) still open.` : 'No qualifying windows. Quiet tick.');
   }
 
