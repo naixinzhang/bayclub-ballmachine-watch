@@ -24,6 +24,9 @@ jobs:
       # Optional: ntfy.sh access token. Required for email forwarding —
       # without it the Email header is dropped (anonymous email is rejected).
       NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+      # Optional dead-man's switch: a healthchecks.io (or equivalent) ping URL.
+      # Unset = the heartbeat step is skipped and nothing else changes.
+      HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
     steps:
       - uses: actions/checkout@v4
 
@@ -73,6 +76,19 @@ jobs:
           BAYCLUB_USERNAME: ${{ secrets.BAYCLUB_USERNAME }}
           BAYCLUB_PASSWORD: ${{ secrets.BAYCLUB_PASSWORD }}
         run: node check.js --login
+
+      # A failure hook can only fire on a run that actually ran. If the trigger
+      # itself dies -- as the Apps Script one did on 2026-09-01 -- GitHub does
+      # nothing and says nothing. This heartbeat is the other half: an external
+      # monitor alerts when the pings stop arriving.
+      # Deliberately non-fatal. A missed ping is what the monitor is for, and
+      # failing the job here would fire the failure alert for the same problem.
+      - name: Heartbeat (dead-man's switch)
+        if: success() && env.HEALTHCHECK_URL != ''
+        run: |
+          curl -fsS --retry 3 --retry-delay 2 --max-time 15 "$HEALTHCHECK_URL" > /dev/null \
+            && echo "heartbeat sent" \
+            || echo "heartbeat ping FAILED -- the monitor will report this as a missed check-in"
 
       # Must sit before "Save state" so the alert's own dedup timestamp is
       # written into the cache along with everything else.
