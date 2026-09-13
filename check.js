@@ -3,10 +3,13 @@
 //   node check.js --try-cached : use cached API headers; if missing/expired, signal need_login
 //   node check.js --login      : headless login via Playwright, capture headers, then check
 //
-// Criteria: Court 1 (ballMachine=true) only, >=60 min contiguous free,
-// excluding Monday 7-9pm and Tuesday 9am-3pm Pacific. Horizon: today +3 days
-// (the club's daysAheadLimit). Notifies via ntfy.sh push, deduped so the same
-// set of open slots is only pushed once.
+// Two alert categories, both >=60 min contiguous free, horizon today +3 days
+// (the club's daysAheadLimit), both skipping the user's busy blocks
+// (Monday 7-9pm, Tuesday 9am-3pm Pacific):
+//   1. Court 1 (ballMachine=true) -- any time of day.
+//   2. Every other court -- evenings only, the hour must sit at/after 7pm.
+// Notifies via ntfy.sh push. Dedup is per individual slot, so a change on one
+// court never re-pushes the slots you were already told about.
 
 process.env.TZ = 'America/Los_Angeles';
 
@@ -23,6 +26,8 @@ const QS =
   '&timeSlotId=37ef7bde-8580-48c3-aced-776ada7c2832&tennisCourtTypeCode=outdoor';
 const apiUrl = (d) =>
   `https://connect-api.bayclubs.io/court-booking/api/1.0/courtsheet/${CLUB}/courts?date=${d}${QS}`;
+
+const EVENING_START = 19 * 60; // other courts only count from 7pm on
 
 const NTFY_TOPIC = process.env.NTFY_TOPIC;
 const NTFY_EMAIL = process.env.NTFY_EMAIL; // optional: also forward each alert to this email
@@ -82,9 +87,60 @@ function fmt(m) {
   return h12 + ':' + String(mm).padStart(2, '0') + ap;
 }
 
-// Returns {ok, loggedOut, hits, errors}
+// Merge the API's 30-min availability entries into contiguous free ranges.
+function freeRanges(court) {
+  const free = (court.availability || [])
+    .filter((s) => !s.unavailability)
+    .map((s) => [s.fromInMinutes, s.toInMinutes])
+    .sort((a, b) => a[0] - b[0]);
+  const ranges = [];
+  for (const [f, t] of free) {
+    if (ranges.length && ranges[ranges.length - 1][1] === f) ranges[ranges.length - 1][1] = t;
+    else ranges.push([f, t]);
+  }
+  return ranges;
+}
+
+// The user's standing commitments. Applied to every court, so e.g. a Monday
+// 7:30pm opening on Court 5 is correctly ignored.
+function applyExclusions(ranges, dow) {
+  const excl = [];
+  if (dow === 1) excl.push([19 * 60, 21 * 60]); // Monday 7-9pm
+  if (dow === 2) excl.push([9 * 60, 15 * 60]);  // Tuesday 9am-3pm
+  let usable = ranges;
+  for (const [ef, et] of excl) {
+    const next = [];
+    for (const [f, t] of usable) {
+      if (t <= ef || f >= et) { next.push([f, t]); continue; }
+      if (f < ef) next.push([f, ef]);
+      if (t > et) next.push([et, t]);
+    }
+    usable = next;
+  }
+  return usable;
+}
+
+// Bookable 1-hour windows: clipped to `notBefore` (7pm for non-ball-machine
+// courts) and to now for today, snapped up to the 30-min booking grid, and
+// only kept if a full hour still fits after that snapping.
+function hourWindows(ranges, notBefore, nowMin) {
+  const floor = Math.max(notBefore, nowMin);
+  const out = [];
+  for (const [f, t] of ranges) {
+    const start = Math.ceil(Math.max(f, floor) / 30) * 30;
+    if (t - start >= 60) out.push(fmt(start) + '-' + fmt(t));
+  }
+  return out;
+}
+
+// "TENNIS 1" and "Tennis 2" both come back from the API; normalise for display.
+function courtName(c) {
+  return String(c.name || '').trim().replace(/^tennis\b/i, 'Tennis');
+}
+
+// Returns {ok, loggedOut, ballMachine, evening, errors}
 async function checkAvailability(headers) {
-  const hits = [], errors = [];
+  const ballMachine = [], evening = [], errors = [];
   const now = new Date();
   for (let d = 0; d <= 3; d++) {
     const dt = new Date(now.getFullYear(), now.getMonth(), now.getDate() + d);
@@ -96,75 +152,110 @@ async function checkAvailability(headers) {
     if (r.status === 401 || r.status === 403) return { ok: false, loggedOut: true };
     if (!r.ok) { errors.push(ds + ': HTTP ' + r.status); continue; }
     const j = await r.json();
-    const c1 = (j.items || []).find((c) => c.ballMachine);
-    if (!c1) { errors.push(ds + ': no ball machine court'); continue; }
-
-    const free = (c1.availability || [])
-      .filter((s) => !s.unavailability)
-      .map((s) => [s.fromInMinutes, s.toInMinutes])
-      .sort((a, b) => a[0] - b[0]);
-    const ranges = [];
-    for (const [f, t] of free) {
-      if (ranges.length && ranges[ranges.length - 1][1] === f) ranges[ranges.length - 1][1] = t;
-      else ranges.push([f, t]);
-    }
+    const items = j.items || [];
+    if (!items.length) { errors.push(ds + ': no courts returned'); continue; }
+    if (!items.some((c) => c.ballMachine)) errors.push(ds + ': no ball machine court');
 
     const dow = dt.getDay();
-    const excl = [];
-    if (dow === 1) excl.push([19 * 60, 21 * 60]); // Monday 7-9pm
-    if (dow === 2) excl.push([9 * 60, 15 * 60]);  // Tuesday 9am-3pm
-    let usable = ranges;
-    for (const [ef, et] of excl) {
-      const next = [];
-      for (const [f, t] of usable) {
-        if (t <= ef || f >= et) { next.push([f, t]); continue; }
-        if (f < ef) next.push([f, ef]);
-        if (t > et) next.push([et, t]);
-      }
-      usable = next;
-    }
-
+    const day = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][dow];
     const nowMin = d === 0 ? now.getHours() * 60 + now.getMinutes() : -1;
-    const wins = usable
-      .filter(([f, t]) => t - f >= 60 && t - Math.max(f, nowMin) >= 60)
-      .map(([f, t]) => fmt(nowMin > f ? Math.ceil(nowMin / 30) * 30 : f) + '-' + fmt(t));
-    if (wins.length) {
-      hits.push({
-        date: ds,
-        day: ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][dow],
-        windows: wins,
-      });
+
+    for (const c of items) {
+      const usable = applyExclusions(freeRanges(c), dow);
+      // Court 1 is watched all day; every other court only from 7pm.
+      const wins = hourWindows(usable, c.ballMachine ? 0 : EVENING_START, nowMin);
+      if (!wins.length) continue;
+      const bucket = c.ballMachine ? ballMachine : evening;
+      bucket.push({ date: ds, day, court: courtName(c), windows: wins });
     }
   }
-  return { ok: true, hits, errors };
+  return { ok: true, ballMachine, evening, errors };
 }
+
+// ---- dedup -----------------------------------------------------------------
+// Keyed per slot (date|court|window) rather than on the whole result set: with
+// nine courts in play a single booking elsewhere would otherwise re-push every
+// slot you had already been told about.
+function slotKeys(hit) {
+  return hit.windows.map((w) => `${hit.date}|${hit.court}|${w}`);
+}
+
+function pickNew(hits, announced) {
+  const fresh = [];
+  for (const h of hits) {
+    const windows = h.windows.filter((w) => !announced[`${h.date}|${h.court}|${w}`]);
+    if (windows.length) fresh.push({ ...h, windows });
+  }
+  return fresh;
+}
+
+// One line per date: "Sat 09-13: Tennis 5 7:30PM-8:30PM, Tennis 7 8PM-9PM"
+function formatHits(hits, withCourt) {
+  const byDate = new Map();
+  for (const h of hits) {
+    if (!byDate.has(h.date)) byDate.set(h.date, { day: h.day, parts: [] });
+    const label = withCourt ? h.court + ' ' : '';
+    for (const w of h.windows) byDate.get(h.date).parts.push(label + w);
+  }
+  return [...byDate.entries()]
+    .sort((a, b) => (a[0] < b[0] ? -1 : 1))
+    .map(([date, v]) => `${v.day} ${date.slice(5)}: ${v.parts.join(', ')}`);
+}
+
+const BOOK_URL = 'https://bayclubconnect.com/racquet-sports/create-booking/' + CLUB;
 
 async function notifyIfNew(result) {
   const state = readJson(STATE_FILE, {});
-  const key = JSON.stringify(result.hits);
-  if (result.errors && result.errors.length) console.log('errors:', result.errors);
-  if (result.hits.length === 0) {
-    console.log('No 1-hour ball machine windows. Quiet tick.');
-  } else if (key === state.lastHitsKey) {
-    console.log('Slots unchanged since last notification; not re-pushing.', key);
-  } else {
-    const lines = result.hits.map((h) => `${h.day} ${h.date}: ${h.windows.join(', ')}`);
-    const sent = await ntfy(
-      'Bay Club ball machine Court 1 AVAILABLE',
-      lines.join('\n') + '\nBook: https://bayclubconnect.com/racquet-sports/create-booking/' + CLUB
-    );
-    if (!sent) {
-      // Leave dedup state untouched so the next run retries instead of
-      // silently marking these slots as already announced.
-      console.error('Alert NOT delivered; leaving state so the next run retries.');
-      process.exitCode = 1;
-      return;
-    }
-    console.log('Notified:', lines.join(' | '));
+  // Drop slots for dates that have passed so the map cannot grow without bound.
+  const today = dateStr(new Date());
+  const announced = {};
+  for (const [k, v] of Object.entries(state.announced || {})) {
+    if (k.split('|')[0] >= today) announced[k] = v;
   }
-  state.lastHitsKey = key;
+
+  if (result.errors && result.errors.length) console.log('errors:', result.errors);
+
+  const alerts = [
+    {
+      hits: pickNew(result.ballMachine, announced),
+      title: 'Bay Club ball machine Court 1 AVAILABLE',
+      withCourt: false,
+      priority: 'high',
+    },
+    {
+      hits: pickNew(result.evening, announced),
+      title: 'Bay Club evening court AVAILABLE (7pm+)',
+      withCourt: true,
+      priority: 'default',
+    },
+  ];
+
+  if (!alerts.some((a) => a.hits.length)) {
+    const open = result.ballMachine.length + result.evening.length;
+    console.log(open ? `Nothing new; ${open} known slot(s) still open.` : 'No qualifying windows. Quiet tick.');
+  }
+
+  let failed = false;
+  for (const a of alerts) {
+    if (!a.hits.length) continue;
+    const lines = formatHits(a.hits, a.withCourt);
+    const sent = await ntfy(a.title, lines.join('\n') + '\nBook: ' + BOOK_URL, a.priority);
+    if (!sent) {
+      // Leave these slots unmarked so the next run retries instead of
+      // silently marking them as already announced.
+      console.error('Alert NOT delivered; leaving state so the next run retries:', a.title);
+      failed = true;
+      continue;
+    }
+    for (const h of a.hits) for (const k of slotKeys(h)) announced[k] = true;
+    console.log('Notified:', a.title, '|', lines.join(' | '));
+  }
+
+  state.announced = announced;
+  delete state.lastHitsKey; // superseded by per-slot dedup
   state.loginFailNotified = false;
   writeJson(STATE_FILE, state);
+  if (failed) process.exitCode = 1;
 }
 
 async function login() {
