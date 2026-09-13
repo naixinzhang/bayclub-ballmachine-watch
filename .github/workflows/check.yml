@@ -52,8 +52,20 @@ jobs:
       - name: Install Playwright (login needed)
         if: steps.cached.outputs.need_login == 'true'
         run: |
+          # `--with-deps` runs `apt-get update`, which fails if ANY repo on the
+          # runner image has stale metadata -- including third-party ones we
+          # don't need. On 2026-09-09 a hash-sum mismatch on Google's Chrome
+          # repo killed a run. Drop those lists, and retry the install.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*.list \
+                     /etc/apt/sources.list.d/microsoft-prod*.list
           npm ci
-          npx playwright install --with-deps chromium
+          ok=
+          for i in 1 2 3; do
+            if npx playwright install --with-deps chromium; then ok=1; break; fi
+            echo "playwright install attempt $i failed; retrying in 20s"
+            sleep 20
+          done
+          [ -n "$ok" ]
 
       - name: Login and check
         if: steps.cached.outputs.need_login == 'true'
