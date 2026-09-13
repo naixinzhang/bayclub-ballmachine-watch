@@ -28,16 +28,22 @@ own title so they stay distinguishable on your phone.
 
 ## Reliability
 
-Three independent layers, because this thing has failed quietly before:
+This thing has failed quietly before, so there are three layers — but note that
+only the first two are currently switched on:
 
 1. **Session cache** — API headers are cached between runs; a headless Playwright
    login only happens when they expire.
 2. **Failure alert** — any run that fails pushes a high-priority notice with a link
    to the run, throttled to one per 6 hours (a broken watcher fails every 15 min).
    A run that completes re-arms it.
-3. **Heartbeat** — every successful run pings `HEALTHCHECK_URL`. This is the only
-   layer that catches the watcher *never starting*, which is exactly what happened
-   on 2026-09-01 when the Apps Script trigger silently wasn't created.
+3. **Heartbeat — built, but OFF.** Every successful run pings `HEALTHCHECK_URL`;
+   with no such secret set the step is skipped. This is the only layer that would
+   catch the watcher *never starting*, which is exactly what happened on
+   2026-09-01 when the Apps Script trigger silently wasn't created. Until a URL is
+   configured, **that failure mode is still unmonitored** — a dead trigger means no
+   runs, no failures, and therefore no alerts of any kind. Verified working against
+   a live endpoint on 2026-09-12; all that's missing is the monitor account.
+   See [Enabling the heartbeat](#enabling-the-heartbeat).
 
 ## Triggering
 
@@ -57,7 +63,7 @@ a degraded backup.
    | `BAYCLUB_USERNAME` | yes | Bay Club Connect member ID |
    | `BAYCLUB_PASSWORD` | yes | Bay Club Connect password |
    | `NTFY_TOPIC` | yes | ntfy topic name |
-   | `HEALTHCHECK_URL` | no | dead-man's switch ping URL (see below) |
+   | `HEALTHCHECK_URL` | no | dead-man's switch ping URL (see below; **not set**) |
    | `NTFY_TOKEN` | no | ntfy account token; required for email forwarding |
    | `NTFY_EMAIL` | no | address to also forward alerts to (needs `NTFY_TOKEN`) |
 
@@ -72,8 +78,9 @@ a degraded backup.
 
 ### Enabling the heartbeat
 
-Without `HEALTHCHECK_URL` the heartbeat step is skipped and everything else works
-normally — but nothing will notice if the watcher stops running altogether.
+**Currently not enabled** — no `HEALTHCHECK_URL` secret is set, so the step is
+skipped and everything else works normally. Nothing will notice if the watcher
+stops running altogether. To turn it on later:
 
 1. Sign up at [healthchecks.io](https://healthchecks.io) (free tier is plenty).
 2. New check → **Period 20 minutes**, **Grace 25 minutes**. That alerts roughly 45
